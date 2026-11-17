@@ -1,0 +1,31 @@
+name: mongo_native
+description: >-
+  MongoDB client for Dart built on the official Rust driver over FFI: replica
+  set monitoring, retryable writes and reads, resumable change streams and
+  typed exceptions for every server and network failure.
+version: 0.1.0
+repository: https://github.com/jodinathan/mongo_native
+issue_tracker: https://github.com/jodinathan/mongo_native/issues
+topics:
+  - mongodb
+  - database
+  - ffi
+  - bson
+
+environment:
+  sdk: '>=3.10.0 <4.0.0'
+
+platforms:
+  linux:
+  macos:
+  windows:
+
+dependencies:
+  code_assets: ^2.2.0
+  crypto: ^3.0.8
+  ffi: ^2.2.0
+  hooks: ^2.2.0
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.26.0

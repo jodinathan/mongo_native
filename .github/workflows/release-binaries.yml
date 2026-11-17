@@ -1,0 +1,113 @@
+name: release-binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version to release (the version of pubspec.yaml, without the v)
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            file: libmongo_native_ffi.dylib
+            build: cargo build --release --locked --target aarch64-apple-darwin
+          - runner: macos-15
+            target: x86_64-apple-darwin
+            file: libmongo_native_ffi.dylib
+            build: cargo build --release --locked --target x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            file: libmongo_native_ffi.so
+            build: cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.28
+          - runner: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            file: libmongo_native_ffi.so
+            build: cargo zigbuild --release --locked --target aarch64-unknown-linux-gnu.2.28
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            file: mongo_native_ffi.dll
+            build: cargo build --release --locked --target x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The version matches pubspec.yaml
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          grep -qx "version: $VERSION" pubspec.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v2
+      - if: runner.os == 'Linux'
+        run: cargo install --locked cargo-zigbuild
+      - name: Build
+        working-directory: native
+        shell: bash
+        run: ${{ matrix.build }}
+      - name: Name the library after its target
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "native/target/${{ matrix.target }}/release/${{ matrix.file }}" "out/${{ matrix.target }}-${{ matrix.file }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: out/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: out
+          merge-multiple: true
+      - name: Draft Release with the five libraries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          cd out
+          sha256sum -- * > ../SHA256SUMS
+          cd ..
+          gh release create "v$VERSION" --draft --title "v$VERSION" --notes "mongo_native $VERSION" \
+            out/* SHA256SUMS THIRD_PARTY_LICENSES
+      - name: Write the sums into lib/src/hook/checksums.dart
+        run: |
+          cp out/x86_64-unknown-linux-gnu-libmongo_native_ffi.so "$RUNNER_TEMP/libmongo_native_ffi.so"
+          cp pubspec.yaml "$RUNNER_TEMP/pubspec.yaml"
+          printf '\nhooks:\n  user_defines:\n    mongo_native:\n      lib: %s\n' "$RUNNER_TEMP/libmongo_native_ffi.so" >> pubspec.yaml
+          dart pub get
+          dart run tool/checksums.dart SHA256SUMS
+          cp "$RUNNER_TEMP/pubspec.yaml" pubspec.yaml
+          dart format lib/src/hook/checksums.dart
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          add-paths: lib/src/hook/checksums.dart
+          branch: release/checksums-v${{ inputs.version }}
+          commit-message: Checksums of the v${{ inputs.version }} libraries
+          title: Checksums of the v${{ inputs.version }} libraries
+          body: >-
+            Writes the sha256 of the five libraries of the draft Release v${{ inputs.version }} into
+            lib/src/hook/checksums.dart. Merge it, then tag v${{ inputs.version }} on the merged commit.

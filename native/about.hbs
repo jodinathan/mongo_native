@@ -1,0 +1,21 @@
+Third-party licenses of the native library of mongo_native
+
+The library libmongo_native_ffi (mongo_native_ffi.dll on Windows) bundles the Rust crates below.
+Each license is listed once, followed by the crates it covers.
+
+{{#each overview}}
+- {{{name}}} ({{count}} crate(s))
+{{/each}}
+
+{{#each licenses}}
+================================================================================
+{{{name}}} ({{id}})
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+{{/each}}
+
+{{{text}}}
+
+{{/each}}

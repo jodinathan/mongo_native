@@ -1,0 +1,163 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MONGODB_TARBALL: mongodb-linux-x86_64-ubuntu2404-9.0.8.tgz
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build
+        working-directory: native
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lib-aarch64-apple-darwin
+          path: native/target/aarch64-apple-darwin/release/libmongo_native_ffi.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lib-x86_64-apple-darwin
+          path: native/target/x86_64-apple-darwin/release/libmongo_native_ffi.dylib
+
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+      - uses: mlugg/setup-zig@v2
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+      - name: Build (glibc 2.28)
+        working-directory: native
+        run: |
+          cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.28
+          cargo zigbuild --release --locked --target aarch64-unknown-linux-gnu.2.28
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lib-x86_64-unknown-linux-gnu
+          path: native/target/x86_64-unknown-linux-gnu/release/libmongo_native_ffi.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lib-aarch64-unknown-linux-gnu
+          path: native/target/aarch64-unknown-linux-gnu/release/libmongo_native_ffi.so
+
+  build-windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build
+        working-directory: native
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lib-x86_64-pc-windows-msvc
+          path: native/target/x86_64-pc-windows-msvc/release/mongo_native_ffi.dll
+
+  load:
+    needs: [build-macos, build-linux, build-windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            file: libmongo_native_ffi.dylib
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            file: libmongo_native_ffi.dylib
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            file: libmongo_native_ffi.so
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            file: libmongo_native_ffi.so
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            file: mongo_native_ffi.dll
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: lib-${{ matrix.target }}
+          path: prebuilt
+      - name: Point the build hook to the prebuilt library (CI checkout only)
+        shell: bash
+        run: |
+          printf '\nhooks:\n  user_defines:\n    mongo_native:\n      lib: prebuilt/%s\n' '${{ matrix.file }}' >> pubspec.yaml
+      - run: dart pub get
+      - run: dart test test/load_test.dart test/bson_codec_test.dart test/hook_resolve_test.dart
+
+  replset:
+    needs: [build-linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: lib-x86_64-unknown-linux-gnu
+          path: prebuilt
+      - name: Point the build hook to the prebuilt library (CI checkout only)
+        run: |
+          printf '\nhooks:\n  user_defines:\n    mongo_native:\n      lib: prebuilt/libmongo_native_ffi.so\n' >> pubspec.yaml
+      - name: Install MongoDB 9.0.8 (sha256 checked)
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://fastdl.mongodb.org/linux/$MONGODB_TARBALL"
+          curl -fsSLO "https://fastdl.mongodb.org/linux/$MONGODB_TARBALL.sha256"
+          sha256sum -c "$MONGODB_TARBALL.sha256"
+          tar -xzf "$MONGODB_TARBALL"
+          echo "MONGOD_PREFIX=$RUNNER_TEMP/${MONGODB_TARBALL%.tgz}" >> "$GITHUB_ENV"
+      - run: dart pub get
+      - run: dart run tool/replset.dart start --nodes 3 --base-port 27117
+      - run: dart test --concurrency=1
+      - if: always()
+        run: dart run tool/replset.dart stop
+
+  analyze:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: dart pub get
+      - run: dart format --set-exit-if-changed .
+      - run: dart analyze --fatal-infos
+      - name: Clippy
+        working-directory: native
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Rust tests
+        working-directory: native
+        run: cargo test --locked
+      - name: Checksums match the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: dart run tool/checksums.dart --check
