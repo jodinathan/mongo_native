@@ -14,10 +14,12 @@ use mongodb::options::{
 use mongodb::{Client, Collection, IndexModel, Namespace};
 
 use crate::cursor;
+use crate::dart::Port;
 use crate::error::{from_driver, NativeError};
 use crate::registry;
 use crate::reply;
 use crate::request::Request;
+use crate::runtime;
 use crate::stream::{self, StreamState, Watch};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -34,8 +36,9 @@ pub fn outcome_unknown(op: &str, req: &Request) -> bool {
     }
 }
 
-/// Decodes [bytes], runs the request under its client clock and returns the reply document.
-pub async fn dispatch(request: u64, bytes: Vec<u8>) -> Result<RawDocumentBuf, NativeError> {
+/// Decodes [bytes], runs the request under its client clock and returns the reply document; a
+/// client opened by it belongs to the isolate behind [port].
+pub async fn dispatch(request: u64, port: Port, bytes: Vec<u8>) -> Result<RawDocumentBuf, NativeError> {
     let req = Request::parse(&bytes)?;
     let target = req.target();
     let unknown = outcome_unknown(&req.op, &req);
@@ -45,7 +48,7 @@ pub async fn dispatch(request: u64, bytes: Vec<u8>) -> Result<RawDocumentBuf, Na
     };
     registry::describe(request, &target, unknown, client)?;
     let timeout = req.millis("timeoutMs").unwrap_or(DEFAULT_TIMEOUT);
-    match tokio::time::timeout(timeout, Box::pin(run(&req, &target))).await {
+    match tokio::time::timeout(timeout, Box::pin(run(&req, &target, port))).await {
         Ok(result) => result,
         Err(_) => Err(NativeError::new(
             "timeout",
@@ -64,10 +67,10 @@ pub async fn dispatch(request: u64, bytes: Vec<u8>) -> Result<RawDocumentBuf, Na
     }
 }
 
-async fn run(req: &Request, target: &str) -> Result<RawDocumentBuf, NativeError> {
+async fn run(req: &Request, target: &str, port: Port) -> Result<RawDocumentBuf, NativeError> {
     let op = req.op.as_str();
     match op {
-        "client.open" => open_client(req, target).await,
+        "client.open" => open_client(req, target, port).await,
         "client.close" => close_client(req, target).await,
         "cursor.next" => cursor::next(req, target).await,
         "cursor.close" => cursor::close(req, target).await,
@@ -86,7 +89,7 @@ fn driver(target: &str) -> impl FnOnce(mongodb::error::Error) -> NativeError + '
     move |e| from_driver(target, e)
 }
 
-async fn open_client(req: &Request, target: &str) -> Result<RawDocumentBuf, NativeError> {
+async fn open_client(req: &Request, target: &str, port: Port) -> Result<RawDocumentBuf, NativeError> {
     let uri = req.str("uri")?;
     let mut options = ClientOptions::parse(uri).await.map_err(driver(target))?;
     if let Some(name) = req.opt_str("appName") {
@@ -129,19 +132,41 @@ async fn open_client(req: &Request, target: &str) -> Result<RawDocumentBuf, Nati
         options.retry_reads = Some(b);
     }
     let client = Client::with_options(options).map_err(driver(target))?;
-    let handle = registry::insert_client(client);
+    let handle = registry::insert_client(client, port);
     reply::document(target, &doc! { "client": handle as i64 })
 }
 
 async fn close_client(req: &Request, target: &str) -> Result<RawDocumentBuf, NativeError> {
     let handle = req.handle("client")?;
-    let closing = registry::close_client(handle, target)?;
+    let operation = target.to_string();
+    runtime::handle()
+        .spawn(async move { shutdown_client(handle, &operation).await })
+        .await
+        .map_err(|e| NativeError::internal(target, format!("the client shutdown task failed: {e}")))??;
+    reply::document(target, &doc! {})
+}
+
+/// Closes the client [handle]: aborts its requests in flight, drops its cursors and streams, waits
+/// for the aborted requests to be answered, shuts the driver client down and forgets it. Runs as its
+/// own task, so that a `client.close` that times out does not leave the client half closed.
+async fn shutdown_client(handle: u64, operation: &str) -> Result<(), NativeError> {
+    let closing = registry::close_client(handle, operation)?;
     drop(closing.cursors);
     drop(closing.streams);
     registry::settled(handle).await;
     closing.client.shutdown().immediate(true).await;
     registry::remove_client(handle);
-    reply::document(target, &doc! {})
+    Ok(())
+}
+
+/// Closes, in the background, every client whose replies go to [port], after that port was found
+/// closed: its isolate ended, so nobody can use or close those clients anymore.
+pub fn retire(port: Port) {
+    for handle in registry::clients_of(port) {
+        runtime::handle().spawn(async move {
+            let _ = shutdown_client(handle, &format!("client.close after the isolate of port {port} ended")).await;
+        });
+    }
 }
 
 fn namespace_of(model: &Document, target: &str) -> Result<Namespace, NativeError> {

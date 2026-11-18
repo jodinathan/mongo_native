@@ -35,12 +35,7 @@ done
     return script.path;
   }
 
-  Future<Uri> resolve({
-    Uri? prebuilt,
-    Map<String, String> checksums = const {},
-    String cargo = 'cargo',
-    Map<String, String>? environment,
-  }) => resolveNativeLibrary(
+  Future<Uri> resolve({Uri? prebuilt, Map<String, String> checksums = const {}, String? cargo}) => resolveNativeLibrary(
     os: OS.linux,
     arch: Architecture.x64,
     packageRoot: Directory.current.uri,
@@ -49,14 +44,12 @@ done
     checksums: checksums,
     version: '9.9.9',
     releaseBase: 'http://127.0.0.1:${server.port}/releases',
-    cargo: cargo,
-    environment: environment ?? {'PATH': '${tmp.path}/emptybin'},
+    cargo: cargo ?? '${tmp.path}/absent-cargo',
     downloadTimeout: const Duration(seconds: 5),
   );
 
   setUp(() async {
     tmp = await Directory.systemTemp.createTemp('mn_hook_');
-    Directory('${tmp.path}/emptybin').createSync();
     served = {};
     requests = 0;
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -86,7 +79,13 @@ done
   test('a missing prebuilt library throws StateError with the resolved path', () async {
     await expectLater(
       resolve(prebuilt: Uri.file('${tmp.path}/absent.so')),
-      throwsA(isA<StateError>().having((e) => e.message, 'message', contains('${tmp.path}/absent.so'))),
+      throwsA(
+        isA<StateError>().having(
+          (e) => e.message,
+          'message',
+          contains('${tmp.path}${Platform.pathSeparator}absent.so'),
+        ),
+      ),
     );
   });
 

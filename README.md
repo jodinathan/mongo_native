@@ -144,6 +144,10 @@ it. `outcomeUnknown` says which:
 their result, when it arrived first), closes the client's cursors and streams, and completes after
 all of them. An idle open client does not keep the process alive.
 
+When the isolate that opened a client ends, by returning or through `Isolate.kill`, the client is
+closed for it: replies still on their way are dropped, its operations in flight are aborted and its
+connections are released.
+
 ## Requirements and limits
 
 - MongoDB 4.2 or newer for the CRUD operations; `bulkWrite` (the cross-collection command) needs

@@ -1,4 +1,4 @@
-//! The process-wide tokio runtime and the delivery of completions.
+//! The process-wide tokio runtime and the delivery of replies.
 
 use std::future::Future;
 use std::sync::OnceLock;
@@ -8,13 +8,11 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::oneshot;
 use tokio::task::JoinError;
 
+use crate::dart::{self, Port};
 use crate::error::NativeError;
+use crate::ops;
 use crate::registry;
 use crate::reply::{error_bytes, STATUS_ERROR, STATUS_OK};
-
-/// Called once per request with its id, the status and the reply bytes, which the receiver releases
-/// with `mn_free`.
-pub type Completion = extern "C" fn(request: u64, status: i32, data: *mut u8, len: usize);
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
@@ -33,9 +31,10 @@ pub fn handle() -> &'static Runtime {
     })
 }
 
-/// Runs [work] for [request] and reports its outcome through [completion]: the result, its error,
-/// the cancellation or the panic.
-pub fn spawn<F>(request: u64, completion: Completion, work: F)
+/// Runs [work] for [request] and posts its outcome to [port]: the result, its error, the
+/// cancellation or the panic. When the port is closed (its isolate ended), the reply is dropped and
+/// the clients opened through that port are closed.
+pub fn spawn<F>(request: u64, port: Port, work: F)
 where
     F: Future<Output = Result<RawDocumentBuf, NativeError>> + Send + 'static,
 {
@@ -57,8 +56,12 @@ where
                 (STATUS_ERROR, error_bytes(&NativeError::internal(&op, panic_text(join))))
             }
         };
-        deliver(request, completion, status, bytes);
+        let delivered = dart::post_reply(port, request, status, &bytes);
+        drop(bytes);
         registry::forget(request);
+        if !delivered {
+            ops::retire(port);
+        }
     });
 }
 
@@ -70,12 +73,4 @@ fn panic_text(join: JoinError) -> String {
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "unknown panic payload".to_string());
     format!("the native side panicked: {text}; please report it with the operation that triggered it")
-}
-
-fn deliver(request: u64, completion: Completion, status: i32, bytes: Vec<u8>) {
-    let mut boxed = bytes.into_boxed_slice();
-    let len = boxed.len();
-    let ptr = boxed.as_mut_ptr();
-    std::mem::forget(boxed);
-    completion(request, status, ptr, len);
 }

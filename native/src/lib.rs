@@ -1,7 +1,8 @@
-//! C interface of `mongo_native`: one entry point that takes a BSON request and answers through a
-//! completion callback, over the official `mongodb` driver.
+//! C interface of `mongo_native`: one entry point that takes a BSON request and posts the reply to a
+//! Dart port, over the official `mongodb` driver.
 
 mod cursor;
+mod dart;
 mod error;
 mod ops;
 mod registry;
@@ -10,13 +11,12 @@ mod request;
 mod runtime;
 mod stream;
 
+use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use runtime::Completion;
-
 /// The version of this C interface; the Dart side refuses a library that speaks another one.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
@@ -26,13 +26,50 @@ pub extern "C" fn mn_abi_version() -> u32 {
     ABI_VERSION
 }
 
+/// Reads the Dart VM functions from `NativeApi.initializeApiDLData` at [data]; returns 0, or -1 when
+/// the VM speaks another major version of the dynamically linked API, -2 when it lacks a function
+/// this library needs, -3 when [data] is null. Calling it again after a success does nothing.
+///
+/// # Safety
+/// [data] must be null or the `NativeApi.initializeApiDLData` of the running VM.
+#[no_mangle]
+pub unsafe extern "C" fn mn_init(data: *mut c_void) -> isize {
+    catch_unwind(|| unsafe { dart::initialize(data) }).unwrap_or(dart::INIT_MISSING)
+}
+
+/// The id of the native port that isolates name in `Isolate.addOnExitListener`, with the port of
+/// their replies as the response: when an isolate ends, the clients it opened are closed. Returns 0
+/// when the port could not be created or [mn_init] did not succeed.
+#[no_mangle]
+pub extern "C" fn mn_exit_port() -> i64 {
+    catch_unwind(|| dart::exit_port(on_isolate_exit)).unwrap_or(0)
+}
+
+/// A new `SendPort` to the port [port], as a Dart handle.
+///
+/// # Safety
+/// Must be called from Dart through FFI with a `Handle` return type, after [mn_init] succeeded.
+#[no_mangle]
+pub unsafe extern "C" fn mn_send_port(port: i64) -> dart::Handle {
+    unsafe { dart::send_port(port) }
+}
+
+extern "C" fn on_isolate_exit(_destination: dart::Port, message: *mut dart::CObject) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(port) = unsafe { dart::integer(message) } {
+            ops::retire(port);
+        }
+    }));
+}
+
 /// Copies the BSON request at `ptr`/`len`, runs it in the background and returns its id, unique in
-/// the process; `completion` receives the reply. Returns 0 when the request could not be queued.
+/// the process; the reply is posted to the Dart port `port` as `[id, status, bytes]`. Returns 0 when
+/// the request could not be queued.
 ///
 /// # Safety
 /// `ptr` must point to `len` readable bytes for the duration of the call.
 #[no_mangle]
-pub unsafe extern "C" fn mn_submit(completion: Completion, ptr: *const u8, len: usize) -> u64 {
+pub unsafe extern "C" fn mn_submit(port: i64, ptr: *const u8, len: usize) -> u64 {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let request = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
         let bytes = if ptr.is_null() || len == 0 {
@@ -40,7 +77,7 @@ pub unsafe extern "C" fn mn_submit(completion: Completion, ptr: *const u8, len: 
         } else {
             unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
         };
-        runtime::spawn(request, completion, async move { ops::dispatch(request, bytes).await });
+        runtime::spawn(request, port, async move { ops::dispatch(request, port, bytes).await });
         request
     }));
     outcome.unwrap_or(0)
@@ -50,17 +87,6 @@ pub unsafe extern "C" fn mn_submit(completion: Completion, ptr: *const u8, len: 
 #[no_mangle]
 pub extern "C" fn mn_cancel(request: u64) -> i32 {
     catch_unwind(|| registry::cancel(request) as i32).unwrap_or(0)
-}
-
-/// Releases a reply buffer handed to a completion callback.
-///
-/// # Safety
-/// `ptr`/`len` must be exactly a buffer received by a completion callback, released once.
-#[no_mangle]
-pub unsafe extern "C" fn mn_free(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() {
-        unsafe { drop(Vec::from_raw_parts(ptr, len, len)) }
-    }
 }
 
 #[cfg(test)]
@@ -74,14 +100,25 @@ mod tests {
 
     type Replies = (Mutex<HashMap<u64, (i32, Vec<u8>)>>, Condvar);
 
-    static REPLIES: LazyLock<Replies> = LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
+    const PORT: dart::Port = 7;
+    const CLOSED_PORT: dart::Port = 8;
 
-    extern "C" fn record(request: u64, status: i32, data: *mut u8, len: usize) {
-        let bytes = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
-        unsafe { mn_free(data, len) };
+    static REPLIES: LazyLock<Replies> = LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
+    static INSTALLED: LazyLock<isize> = LazyLock::new(|| dart::testing::install(record));
+
+    unsafe extern "C" fn record(port: dart::Port, message: *mut dart::CObject) -> bool {
+        if port != PORT {
+            return false;
+        }
+        let (request, status, bytes) = unsafe { dart::testing::read_reply(message) };
         let (map, signal) = &*REPLIES;
         map.lock().unwrap().insert(request, (status, bytes));
         signal.notify_all();
+        true
+    }
+
+    fn installed() {
+        assert_eq!(*INSTALLED, dart::INIT_OK);
     }
 
     fn wait(request: u64) -> (i32, Document) {
@@ -94,13 +131,18 @@ mod tests {
                 return (status, doc);
             }
             let left = deadline.saturating_duration_since(Instant::now());
-            assert!(!left.is_zero(), "no completion for request {request}");
+            assert!(!left.is_zero(), "no reply for request {request}");
             guard = signal.wait_timeout(guard, left).unwrap().0;
         }
     }
 
     fn submit(bytes: &[u8]) -> u64 {
-        unsafe { mn_submit(record, bytes.as_ptr(), bytes.len()) }
+        submit_to(PORT, bytes)
+    }
+
+    fn submit_to(port: dart::Port, bytes: &[u8]) -> u64 {
+        installed();
+        unsafe { mn_submit(port, bytes.as_ptr(), bytes.len()) }
     }
 
     fn encode(doc: &Document) -> Vec<u8> {
@@ -110,8 +152,26 @@ mod tests {
     }
 
     #[test]
-    fn abi_version_is_one() {
-        assert_eq!(mn_abi_version(), 1);
+    fn abi_version_is_two() {
+        assert_eq!(mn_abi_version(), 2);
+    }
+
+    #[test]
+    fn init_after_a_success_does_nothing() {
+        installed();
+        assert_eq!(unsafe { mn_init(std::ptr::null_mut()) }, dart::INIT_OK);
+    }
+
+    #[test]
+    fn reply_to_a_closed_port_is_dropped_and_the_request_forgotten() {
+        let id = submit_to(CLOSED_PORT, &encode(&doc! { "noop": 1 }));
+        assert_ne!(id, 0);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while registry::tracked(id) {
+            assert!(Instant::now() < deadline, "request {id} still tracked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!REPLIES.0.lock().unwrap().contains_key(&id));
     }
 
     #[test]
@@ -132,7 +192,8 @@ mod tests {
     #[test]
     fn panic_in_a_task_answers_kind_internal() {
         let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
-        runtime::spawn(id, record, async { panic!("forced panic for the test") });
+        installed();
+        runtime::spawn(id, PORT, async { panic!("forced panic for the test") });
         let (status, reply) = wait(id);
         assert_eq!(status, reply::STATUS_ERROR);
         assert_eq!(reply.get_str("kind").unwrap(), "internal");

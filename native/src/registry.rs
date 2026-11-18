@@ -9,6 +9,7 @@ use mongodb::{Client, Cursor};
 use tokio::sync::Notify;
 use tokio::task::AbortHandle;
 
+use crate::dart::Port;
 use crate::error::NativeError;
 use crate::stream::StreamState;
 
@@ -25,6 +26,7 @@ struct RequestEntry {
 
 struct ClientEntry {
     client: Client,
+    owner: Port,
     closed: bool,
     inflight: HashSet<u64>,
 }
@@ -93,7 +95,7 @@ pub fn describe(request: u64, operation: &str, outcome_unknown: bool, client: Op
     Ok(())
 }
 
-/// Drops [request] from the registry after its completion was delivered.
+/// Drops [request] from the registry after its reply was posted (or dropped with a closed port).
 pub fn forget(request: u64) {
     let mut s = state();
     if let Some(entry) = s.requests.remove(&request) {
@@ -116,6 +118,12 @@ pub fn cancel(request: u64) -> bool {
         }
         None => false,
     }
+}
+
+/// Whether [request] is still in the registry.
+#[cfg(test)]
+pub fn tracked(request: u64) -> bool {
+    state().requests.contains_key(&request)
 }
 
 /// The operation name recorded for [request].
@@ -161,18 +169,29 @@ pub fn client_closed(operation: &str) -> NativeError {
     NativeError::closed(operation, "the client is closed; connect again to keep working")
 }
 
-/// Registers an open [client] and returns its handle.
-pub fn insert_client(client: Client) -> u64 {
+/// Registers an open [client], whose replies go to [owner], and returns its handle.
+pub fn insert_client(client: Client, owner: Port) -> u64 {
     let handle = next_handle();
     state().clients.insert(
         handle,
         ClientEntry {
             client,
+            owner,
             closed: false,
             inflight: HashSet::new(),
         },
     );
     handle
+}
+
+/// The handles of the clients still open whose replies go to [owner].
+pub fn clients_of(owner: Port) -> Vec<u64> {
+    state()
+        .clients
+        .iter()
+        .filter(|(_, c)| c.owner == owner && !c.closed)
+        .map(|(handle, _)| *handle)
+        .collect()
 }
 
 /// The driver client behind [handle].
