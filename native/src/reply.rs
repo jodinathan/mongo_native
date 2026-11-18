@@ -1,4 +1,4 @@
-//! Reply documents sent back through the completion callback.
+//! Reply documents posted back to the Dart port of each request.
 
 use bson::{Bson, Document, RawBson, RawDocumentBuf};
 
