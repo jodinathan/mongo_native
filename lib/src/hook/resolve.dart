@@ -13,7 +13,8 @@ import 'targets.dart';
 ///    used as is;
 /// 2. the library of the Release `v[version]`, cached under [cacheDir] or downloaded from
 ///    [releaseBase], only when [checksums] has its sha256 and the bytes match it;
-/// 3. a build with `cargo` ([cargo], run with [environment]) into [cacheDir];
+/// 3. a build with [cargo] (a command looked up on the PATH, or the path of the executable) into
+///    [cacheDir];
 /// 4. otherwise a [StateError] with the reason of each step and what to do.
 Future<Uri> resolveNativeLibrary({
   required OS os,
@@ -25,7 +26,6 @@ Future<Uri> resolveNativeLibrary({
   String version = kChecksumsVersion,
   String releaseBase = kReleaseBase,
   String cargo = 'cargo',
-  Map<String, String>? environment,
   Duration downloadTimeout = const Duration(seconds: 60),
 }) async {
   if (prebuilt != null) {
@@ -62,7 +62,6 @@ Future<Uri> resolveNativeLibrary({
 
   final built = await _cargoBuild(
     cargo: cargo,
-    environment: environment,
     packageRoot: packageRoot,
     cacheDir: cacheDir,
     target: target,
@@ -128,7 +127,6 @@ Future<File?> _download({
 
 Future<File?> _cargoBuild({
   required String cargo,
-  required Map<String, String>? environment,
   required Uri packageRoot,
   required Uri cacheDir,
   required (String, String)? target,
@@ -140,7 +138,7 @@ Future<File?> _cargoBuild({
   }
   final (triple, fileName) = target;
   try {
-    final probe = await Process.run(cargo, ['--version'], environment: environment);
+    final probe = await Process.run(cargo, ['--version']);
     if (probe.exitCode != 0) {
       reasons.add('`$cargo --version` exited with ${probe.exitCode}: ${probe.stderr}'.trim());
       return null;
@@ -161,7 +159,7 @@ Future<File?> _cargoBuild({
     targetDir.path,
     '--target',
     triple,
-  ], environment: environment);
+  ]);
   final output = File('${targetDir.path}/$triple/release/$fileName');
   if (result.exitCode != 0) {
     final stderr = '${result.stderr}'.trim().split('\n');
